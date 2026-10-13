@@ -30,12 +30,17 @@ interface Watch {
 
 export class HookHealthWatchdog {
   private watches = new Map<string, Watch>();
+  private earlyHooks = new Map<string, number>();
 
   /** The hook server calls this for every validated event. */
   noteHook(agentId: string | undefined, at = Date.now()): HookHealthChange | null {
     if (!agentId) return null;
     const watch = this.watches.get(agentId);
-    if (!watch) return null; // A check-in before first census is fine.
+    if (!watch) {
+      // The server can deliver SessionStart before the first fleet census.
+      this.earlyHooks.set(agentId, at);
+      return null;
+    }
     const recovered = watch.lost;
     watch.lastHookAt = at;
     watch.lost = false;
@@ -54,7 +59,8 @@ export class HookHealthWatchdog {
       live.add(agent.id);
       let watch = this.watches.get(agent.id);
       if (!watch || watch.ptyId !== agent.ptyId) {
-        watch = { ptyId: agent.ptyId, firstOutputSeenAt: null, lastHookAt: null, lost: false };
+        watch = { ptyId: agent.ptyId, firstOutputSeenAt: null, lastHookAt: this.earlyHooks.get(agent.id) ?? null, lost: false };
+        this.earlyHooks.delete(agent.id);
         this.watches.set(agent.id, watch);
       }
       if (!Number.isFinite(agent.lastOutputAt) || agent.lastOutputAt <= 0) continue;
