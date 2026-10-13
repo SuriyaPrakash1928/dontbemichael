@@ -63,6 +63,7 @@ import { MemoryTidy } from './memoryTidy';
 import { checkDistinct, readJobProfile } from './hireCheck';
 import { checkFocusArea, convertWorkStyle, readConvertRequest, readFocusCheckRequest, readSuggestRequest, suggestWorkStyle } from './workStyleConvert';
 import { SafeClearer, type SafeClearDeps } from './safeClearer';
+import { HookHealthWatchdog, type HookHealthChange } from './hookHealth';
 import { PersistStore } from './db';
 import { readAgentUsage, readContextTokens, seedSessionTranscript, resolveSessionCwd } from './transcript';
 import { listIssues, listCIRuns } from './github';
@@ -115,6 +116,7 @@ import { parseHireDeepLink, type HireManifest } from '../shared/hire';
 import { ClosingTimeController } from './closingTime';
 import {
   argsWithAutoModeFlag,
+  bridgeOf,
   inferAgentProvider,
   isClaudeProvider,
   nonInteractiveEnvForProvider,
@@ -413,6 +415,20 @@ function standingGoalFor(agentId: string): string | null {
 // background window can't leave a worker parked on an unread inbox forever).
 // HookServer feeds it the hook stream so a permission/HITL prompt blocks nudges.
 const workerWake = new WorkerWakeWatchdog();
+const hookHealth = new HookHealthWatchdog();
+
+function reportHookHealth(change: HookHealthChange): void {
+  const name = hive.registry().agents[change.agentId]?.name ?? 'A team member';
+  if (change.state === 'missing') {
+    const message = `${name} is working, but the app is not receiving its engine events. Some folder and tool safeguards may not apply. Restart this team member and check the engine version.`;
+    ownerToast('Agent monitoring interrupted', message);
+    try { hive.appendLog({ kind: 'hook-health-missing', agentId: change.agentId }); } catch { /* best effort */ }
+  } else {
+    ownerToast('Agent monitoring restored', `${name} is reporting engine events again.`);
+    try { hive.appendLog({ kind: 'hook-health-recovered', agentId: change.agentId }); } catch { /* best effort */ }
+  }
+}
+
 // When each agent last accepted a prompt, so a typed nudge can confirm it
 // landed (shared/submitConfirm.ts).
 const promptSubmits = new PromptSubmits();
@@ -428,6 +444,8 @@ const hookServer = new HookServer(
   (agentId, event, message) => {
     workerWake.noteHook(agentId, event, message);
     safeClearer.noteHook(agentId, event, message);
+    const healthChange = hookHealth.noteHook(agentId);
+    if (healthChange) reportHookHealth(healthChange);
     if (agentId && event === 'UserPromptSubmit') promptSubmits.note(agentId);
     if (agentId && (event === 'Notification' || event === 'PermissionRequest')) promptSubmits.noteAttention(agentId);
   },
@@ -7326,6 +7344,20 @@ function armAlwaysOnBeats(): void {
   // (docs/designs/card-lifecycle.md), so a prompt never scans his mail.
   const fleetBeat = (): void => {
     writeFleetSnapshot();
+    try {
+      const reg = hive.enabled() ? hive.registry() : null;
+      const agents = Object.entries(reg?.agents ?? {}).filter(([, a]) => a && !a.archived).map(([id, a]) => {
+        const ptyId = ptyForAgent(id);
+        const provider = a.provider ?? 'claude';
+        return {
+          id,
+          ptyId: ptyId ?? '',
+          expectsHooks: isClaudeProvider(provider) || !!bridgeOf(provider),
+          lastOutputAt: ptyId ? (ptyManager.lastOutputAt(ptyId) ?? 0) : 0
+        };
+      });
+      for (const change of hookHealth.inspect(agents)) reportHookHealth(change);
+    } catch (e) { console.error('[hook-health beat]', e); }
     try { if (hive.enabled()) hive.refreshOwnerRequests(); } catch (e) { console.error('[owner requests]', e); }
   };
   fleetBeat();
